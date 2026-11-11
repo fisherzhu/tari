@@ -24,28 +24,32 @@ use std::{
     convert::Infallible,
     future::Future,
     pin::Pin,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use hyper::{Request, Response, StatusCode, body::Incoming, service::Service};
+use hyper::{Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::{Service, service_fn}};
+use hyper_util::rt::TokioIo;
 use jsonrpc::error::StandardError;
 use minotari_app_utilities::parse_miner_input::{BaseNodeGrpcClient, ShaP2PoolGrpcClient};
 use serde_json::json;
 use tari_common_types::tari_address::TariAddress;
 use tari_core::{consensus::BaseNodeConsensusManager, proof_of_work::randomx_factory::RandomXFactory};
 use tracing::{error, trace, warn};
+use tokio::{net::TcpListener, time::timeout};
 
 use crate::{
     block_template_data::BlockTemplateRepository,
     common::{json_rpc, proxy},
     config::MergeMiningProxyConfig,
     error::MmProxyError,
-    proxy::{inner::InnerService, monerod_method::parse_monerod_rpc_method},
+    proxy::{inner::InnerService, monerod_method::parse_monerod_rpc_method, monerod_route::MonerodRoutes},
 };
 
 const LOG_TARGET: &str = "minotari_mm_proxy::proxy::service";
+const ROUTE_STATUS_PATH: &str = "/internal/monerod-route";
 
 #[derive(Debug, Clone)]
 pub struct MergeMiningProxyService {
@@ -64,8 +68,6 @@ impl MergeMiningProxyService {
     ) -> Result<Self, MmProxyError> {
         trace!(target: LOG_TARGET, "Config: {:?}", config);
         let consensus_manager = BaseNodeConsensusManager::builder(config.network).build()?;
-        // Assign the slowest response monerod server as the last assigned monerod server
-        let last_assigned_monerod_url = config.monerod_url.last().cloned();
         Ok(Self {
             inner: InnerService {
                 config: Arc::new(config),
@@ -74,13 +76,40 @@ impl MergeMiningProxyService {
                 base_node_client,
                 p2pool_client,
                 initial_sync_achieved: Arc::new(AtomicBool::new(false)),
-                current_monerod_server: Arc::new(RwLock::new(None)),
-                last_assigned_monerod_url: Arc::new(RwLock::new(last_assigned_monerod_url)),
+                monerod_routes: Arc::new(MonerodRoutes::new()),
                 randomx_factory,
                 consensus_manager,
                 wallet_payment_address,
             },
         })
+    }
+
+    pub(crate) async fn recover_primary(&self) {
+        self.inner.recover_primary().await;
+    }
+
+    pub(crate) async fn serve_route_status(&self, listener: Option<TcpListener>) -> std::io::Result<()> {
+        let Some(listener) = listener else {
+            return std::future::pending().await;
+        };
+        loop {
+            let (socket, _) = listener.accept().await?;
+            let routes = self.inner.monerod_routes.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let routes = routes.clone();
+                    async move {
+                        if request.method() == Method::GET && request.uri().path() == ROUTE_STATUS_PATH {
+                            proxy::json_response(StatusCode::OK, &routes.observation())
+                        } else {
+                            proxy::json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" }))
+                        }
+                    }
+                });
+                let connection = http1::Builder::new().keep_alive(false).serve_connection(TokioIo::new(socket), service);
+                let _ = timeout(Duration::from_secs(3), connection).await;
+            });
+        }
     }
 }
 
@@ -94,6 +123,9 @@ impl Service<Request<Incoming>> for MergeMiningProxyService {
     fn call(&self, request: Request<Incoming>) -> Self::Future {
         let inner = self.inner.clone();
         let future = async move {
+            if request.uri().path() == ROUTE_STATUS_PATH {
+                return Ok(proxy::json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" }))?);
+            }
             let (parts, body) = request.into_parts();
             let bytes = match proxy::read_body_until_end(body).await {
                 Ok(b) => b,

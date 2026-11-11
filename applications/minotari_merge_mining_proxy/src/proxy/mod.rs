@@ -22,5 +22,6 @@
 
 pub(crate) mod inner;
 mod monerod_method;
+mod monerod_route;
 pub(crate) mod service;
 pub(crate) mod utils;

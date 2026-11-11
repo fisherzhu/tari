@@ -92,6 +92,9 @@ pub struct MergeMiningProxyConfig {
     pub base_node_grpc_ca_cert_filename: String,
     /// Address of the minotari_merge_mining_proxy application
     pub listener_address: Multiaddr,
+    /// Optional port for the read-only route status listener on 127.0.0.1.
+    #[serde(default)]
+    pub monerod_route_status_port: Option<u16>,
     /// In sole merged mining, the block solution is usually submitted to the Monero blockchain (monerod) as well as to
     /// the Minotari blockchain, then this setting should be "true". With pool merged mining, there is no sense in
     /// submitting the solution to the Monero blockchain as thepool does that, then this setting should be "false".
@@ -161,6 +164,7 @@ impl fmt::Debug for MergeMiningProxyConfig {
             .field("base_node_grpc_tls_domain_name", &self.base_node_grpc_tls_domain_name)
             .field("base_node_grpc_ca_cert_filename", &self.base_node_grpc_ca_cert_filename)
             .field("listener_address", &self.listener_address)
+            .field("monerod_route_status_port", &self.monerod_route_status_port)
             .field("submit_to_origin", &self.submit_to_origin)
             .field(
                 "wait_for_initial_sync_at_startup",
@@ -232,6 +236,7 @@ impl Default for MergeMiningProxyConfig {
             base_node_grpc_tls_domain_name: None,
             base_node_grpc_ca_cert_filename: "node_ca.pem".to_string(),
             listener_address: "/ip4/127.0.0.1/tcp/18081".parse().unwrap(),
+            monerod_route_status_port: None,
             submit_to_origin: true,
             wait_for_initial_sync_at_startup: true,
             check_tari_difficulty_before_submit: true,
