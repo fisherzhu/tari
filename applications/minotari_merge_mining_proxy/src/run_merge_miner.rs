@@ -119,6 +119,10 @@ pub async fn start_merge_miner(cli: Cli) -> Result<(), anyhow::Error> {
     }
 
     let listen_addr = multiaddr_to_socketaddr(&config.listener_address)?;
+    let status_listener = match config.monerod_route_status_port {
+        Some(port) => Some(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?),
+        None => None,
+    };
     let randomx_factory = RandomXFactory::new(config.max_randomx_vms);
     let block_templates = BlockTemplateRepository::new();
 
@@ -153,9 +157,13 @@ pub async fn start_merge_miner(cli: Cli) -> Result<(), anyhow::Error> {
             println!("Listening on {listen_addr}...");
 
             let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+            let mut recover_primary = Box::pin(randomx_service.recover_primary());
+            let mut serve_route_status = Box::pin(randomx_service.serve_route_status(status_listener));
             loop {
                 let mut listen_fut = Box::pin(listener.accept());
                 tokio::select! {
+                    () = &mut recover_primary => break,
+                    result = &mut serve_route_status => { result?; break; },
                     _ = &mut shutdown => {
                         info!(target: LOG_TARGET, "Ctrl-C received, shutting down merge mining proxy...");
                         println!("Ctrl-C: shutting down merge mining proxy...");
