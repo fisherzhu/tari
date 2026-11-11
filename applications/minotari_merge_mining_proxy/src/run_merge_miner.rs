@@ -163,7 +163,7 @@ pub async fn start_merge_miner(cli: Cli) -> Result<(), anyhow::Error> {
                 let mut listen_fut = Box::pin(listener.accept());
                 tokio::select! {
                     () = &mut recover_primary => break,
-                    result = &mut serve_route_status => { result?; break; },
+                    () = &mut serve_route_status => break,
                     _ = &mut shutdown => {
                         info!(target: LOG_TARGET, "Ctrl-C received, shutting down merge mining proxy...");
                         println!("Ctrl-C: shutting down merge mining proxy...");
