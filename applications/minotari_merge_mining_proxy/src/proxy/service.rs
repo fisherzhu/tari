@@ -38,7 +38,7 @@ use serde_json::json;
 use tari_common_types::tari_address::TariAddress;
 use tari_core::{consensus::BaseNodeConsensusManager, proof_of_work::randomx_factory::RandomXFactory};
 use tracing::{error, trace, warn};
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{net::TcpListener, time::{sleep, timeout}};
 
 use crate::{
     block_template_data::BlockTemplateRepository,
@@ -88,12 +88,19 @@ impl MergeMiningProxyService {
         self.inner.recover_primary().await;
     }
 
-    pub(crate) async fn serve_route_status(&self, listener: Option<TcpListener>) -> std::io::Result<()> {
+    pub(crate) async fn serve_route_status(&self, listener: Option<TcpListener>) {
         let Some(listener) = listener else {
             return std::future::pending().await;
         };
         loop {
-            let (socket, _) = listener.accept().await?;
+            let socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(err) => {
+                    warn!(target: LOG_TARGET, "Could not accept a route status connection: {err}");
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                },
+            };
             let routes = self.inner.monerod_routes.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request: Request<Incoming>| {
