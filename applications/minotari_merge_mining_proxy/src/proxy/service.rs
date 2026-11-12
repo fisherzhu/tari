@@ -23,22 +23,20 @@
 use std::{
     convert::Infallible,
     future::Future,
+    net::IpAddr,
     pin::Pin,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
 };
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use hyper::{Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::{Service, service_fn}};
-use hyper_util::rt::TokioIo;
+use hyper::{Method, Request, Response, StatusCode, body::Incoming, header::{CACHE_CONTROL, HeaderValue}, service::Service};
 use jsonrpc::error::StandardError;
 use minotari_app_utilities::parse_miner_input::{BaseNodeGrpcClient, ShaP2PoolGrpcClient};
 use serde_json::json;
 use tari_common_types::tari_address::TariAddress;
 use tari_core::{consensus::BaseNodeConsensusManager, proof_of_work::randomx_factory::RandomXFactory};
 use tracing::{error, trace, warn};
-use tokio::{net::TcpListener, time::{sleep, timeout}};
 
 use crate::{
     block_template_data::BlockTemplateRepository,
@@ -54,6 +52,7 @@ const ROUTE_STATUS_PATH: &str = "/internal/monerod-route";
 #[derive(Debug, Clone)]
 pub struct MergeMiningProxyService {
     inner: InnerService,
+    route_status_allowed: bool,
 }
 
 impl MergeMiningProxyService {
@@ -81,6 +80,7 @@ impl MergeMiningProxyService {
                 consensus_manager,
                 wallet_payment_address,
             },
+            route_status_allowed: false,
         })
     }
 
@@ -88,35 +88,11 @@ impl MergeMiningProxyService {
         self.inner.recover_primary().await;
     }
 
-    pub(crate) async fn serve_route_status(&self, listener: Option<TcpListener>) {
-        let Some(listener) = listener else {
-            return std::future::pending().await;
-        };
-        loop {
-            let socket = match listener.accept().await {
-                Ok((socket, _)) => socket,
-                Err(err) => {
-                    warn!(target: LOG_TARGET, "Could not accept a route status connection: {err}");
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                },
-            };
-            let routes = self.inner.monerod_routes.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |request: Request<Incoming>| {
-                    let routes = routes.clone();
-                    async move {
-                        if request.method() == Method::GET && request.uri().path() == ROUTE_STATUS_PATH {
-                            proxy::json_response(StatusCode::OK, &routes.observation())
-                        } else {
-                            proxy::json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" }))
-                        }
-                    }
-                });
-                let connection = http1::Builder::new().keep_alive(false).serve_connection(TokioIo::new(socket), service);
-                let _ = timeout(Duration::from_secs(3), connection).await;
-            });
-        }
+    pub(crate) fn for_peer(&self, peer: IpAddr) -> Self {
+        let mut service = self.clone();
+        service.route_status_allowed = self.inner.config.monerod_route_status_source_ip
+            .is_some_and(|allowed| allowed.to_canonical() == peer.to_canonical());
+        service
     }
 }
 
@@ -129,9 +105,16 @@ impl Service<Request<Incoming>> for MergeMiningProxyService {
 
     fn call(&self, request: Request<Incoming>) -> Self::Future {
         let inner = self.inner.clone();
+        let route_status_allowed = self.route_status_allowed;
         let future = async move {
             if request.uri().path() == ROUTE_STATUS_PATH {
-                return Ok(proxy::json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" }))?);
+                let mut response = if route_status_allowed && request.method() == Method::GET {
+                    proxy::json_response(StatusCode::OK, &inner.monerod_routes.observation())?
+                } else {
+                    proxy::json_response(StatusCode::NOT_FOUND, &json!({ "error": "not found" }))?
+                };
+                response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                return Ok(response);
             }
             let (parts, body) = request.into_parts();
             let bytes = match proxy::read_body_until_end(body).await {
