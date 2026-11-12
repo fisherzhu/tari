@@ -41,7 +41,7 @@ mod utils;
 
 mod http;
 mod xmrig_proxy;
-use std::{process, sync::Arc, time::Duration};
+use std::{future::Future, io, process, sync::Arc, time::Duration};
 
 use commands::{cli_loop::CliLoop, command::CommandContext};
 use futures::FutureExt;
@@ -342,11 +342,38 @@ pub async fn run_base_node_with_cli(
     }
 
     info!(target: LOG_TARGET, "Minotari base node has STARTED");
-    main_loop.cli_loop(cli.disable_splash_screen).await;
+    run_cli_until_shutdown(
+        main_loop.cli_loop(cli.disable_splash_screen),
+        tokio::signal::ctrl_c(),
+        cli.non_interactive_mode,
+        &shutdown,
+    )
+    .await;
     ctx.wait_for_shutdown().await;
 
     println!("Goodbye!");
     Ok(())
+}
+
+/// The lifecycle owner keeps non-interactive SIGINT responsive while CLI
+/// commands await services, and hands every CLI exit to the shared shutdown.
+async fn run_cli_until_shutdown(
+    cli_loop: impl Future<Output = ()>,
+    interrupt: impl Future<Output = io::Result<()>>,
+    non_interactive: bool,
+    shutdown: &Shutdown,
+) {
+    let mut stopped = shutdown.to_signal();
+    tokio::select! {
+        _ = cli_loop => {},
+        _ = stopped.wait() => {},
+        result = interrupt, if non_interactive => {
+            if let Err(error) = result {
+                warn!(target: LOG_TARGET, "SIGINT listener failed: {error}; shutting down");
+            }
+        },
+    }
+    shutdown.trigger();
 }
 
 /// Runs the gRPC server
@@ -484,7 +511,12 @@ async fn prepare_grpc_params(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, time::Duration};
+    use std::{
+        future::pending,
+        net::SocketAddr,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use futures::FutureExt;
     use minotari_app_grpc::tari_rpc::base_node_server::SERVICE_NAME as BASE_NODE_GRPC_SERVICE_NAME;
@@ -506,7 +538,65 @@ mod tests {
         server::HealthService,
     };
 
-    use super::{grpc_serving_status, is_grpc_health_serving};
+    use super::{grpc_serving_status, is_grpc_health_serving, run_cli_until_shutdown};
+
+    #[tokio::test]
+    async fn cli_shutdown_interrupts_a_pending_initial_command() {
+        let shutdown = Shutdown::new();
+        run_cli_until_shutdown(pending(), async { Ok(()) }, true, &shutdown).await;
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn cli_shutdown_interrupts_a_pending_repeated_command() {
+        let shutdown = Shutdown::new();
+        let (command_entered, entered) = tokio::sync::oneshot::channel();
+        let command_started = AtomicBool::new(false);
+        let cli = async {
+            command_started.store(true, Ordering::SeqCst);
+            command_entered.send(()).unwrap();
+            pending::<()>().await;
+        };
+        let interrupt = async {
+            entered.await.unwrap();
+            Ok(())
+        };
+        run_cli_until_shutdown(cli, interrupt, true, &shutdown).await;
+        assert!(command_started.load(Ordering::SeqCst));
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn cli_shutdown_propagates_normal_return_and_explicit_quit() {
+        let shutdown = Shutdown::new();
+        run_cli_until_shutdown(async {}, pending(), true, &shutdown).await;
+        assert!(shutdown.is_triggered());
+
+        let shutdown = Shutdown::new();
+        let cli = async { shutdown.trigger() };
+        run_cli_until_shutdown(cli, pending(), true, &shutdown).await;
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn cli_shutdown_honors_external_shutdown_with_a_pending_command() {
+        let shutdown = Shutdown::new();
+        shutdown.trigger();
+        run_cli_until_shutdown(pending(), pending(), true, &shutdown).await;
+        assert!(shutdown.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn cli_shutdown_keeps_interactive_ctrl_c_with_the_cli() {
+        let shutdown = Shutdown::new();
+        let interrupt_polled = AtomicBool::new(false);
+        let interrupt = async {
+            interrupt_polled.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        run_cli_until_shutdown(async {}, interrupt, false, &shutdown).await;
+        assert!(!interrupt_polled.load(Ordering::SeqCst));
+    }
 
     fn status_info(bootstrapped: bool, state_info: StateInfo) -> StatusInfo {
         StatusInfo {

@@ -180,7 +180,6 @@ impl CliLoop {
 
     async fn watch_loop_non_interactive(&mut self) {
         if let Some(command) = self.watch_task.take() {
-            let mut interrupt = signal::ctrl_c().fuse().boxed();
             let config = &self.context.config;
             let line = command.line();
             let interval = command
@@ -205,9 +204,6 @@ impl CliLoop {
                                 }
                             }
                             continue;
-                        },
-                        _ = &mut interrupt => {
-                            break;
                         },
                         _ = self.shutdown_signal.wait() => {
                             self.done = true;
